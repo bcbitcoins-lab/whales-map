@@ -1,0 +1,153 @@
+//@version=6
+// Whales Map (TradingView edition)
+// Plots "whale-sized" prints as bubbles sized by dollar value, plus untouched
+// support/resistance shelves from the biggest ones.
+//
+// TradingView scripts can't see individual trades, so each lower-timeframe
+// sub-bar (default 1 minute) inside every chart candle stands in for a print. A sub-bar is a
+// whale print when its notional (volume x price x point value) is an outlier
+// (Auto mode) or above a fixed dollar amount (Fixed mode). Buy vs sell is
+// taken from the sub-bar's direction.
+//
+// Best on symbols with real exchange volume: COMEX:GC1! / MGC1! (gold),
+// NYMEX:CL1! / MCL1! (crude), BINANCE:BTCUSDT.P, etc. On CFD/forex feeds like
+// OANDA:XAUUSD the volume is tick count, so use Auto mode there.
+indicator("Whales Map", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+// ---------- inputs ----------
+grpD = "Detection"
+scanTf    = input.timeframe("1", "Scan timeframe (must be lower than chart)", group = grpD)
+mode      = input.string("Auto (outliers)", "Threshold mode", options = ["Auto (outliers)", "Fixed $"], group = grpD)
+sigmaK    = input.float(3.0, "Auto: std devs above average", minval = 1.0, step = 0.5, group = grpD)
+sampleLen = input.int(1000, "Auto: sample size (sub-bars)", minval = 100, maxval = 5000, group = grpD)
+fixedUsd  = input.float(1000000, "Fixed: minimum notional ($)", minval = 1, group = grpD)
+usePv     = input.bool(true, "Multiply by contract point value (futures)", group = grpD)
+
+grpS = "Shelves"
+showShelf = input.bool(true, "Show shelves", group = grpS)
+shelfMult = input.float(2.0, "Shelf only from prints ≥ this × threshold", minval = 1.0, step = 0.5, group = grpS)
+maxShelf  = input.int(20, "Max live shelves", minval = 1, maxval = 100, group = grpS)
+breakOn   = input.string("Close", "Shelf breaks on", options = ["Close", "Wick"], group = grpS)
+
+grpV = "Style"
+buyCol  = input.color(color.rgb(46, 230, 168), "Buy", group = grpV)
+sellCol = input.color(color.rgb(255, 85, 119), "Sell", group = grpV)
+showTbl = input.bool(true, "Show info panel", group = grpV)
+
+// ---------- lower-timeframe data ----------
+chartSec = timeframe.in_seconds(timeframe.period)
+scanSec  = timeframe.in_seconds(scanTf)
+effTf    = scanSec < chartSec ? scanTf : timeframe.period
+
+[vA, oA, cA, tA] = request.security_lower_tf(syminfo.tickerid, effTf, [volume, open, close, time])
+
+pv = usePv and syminfo.type == "futures" ? syminfo.pointvalue : 1.0
+
+// rolling sample of sub-bar notionals for Auto mode
+var array<float> samples = array.new<float>()
+
+// threshold uses the sample BEFORE this bar is added (no look-ahead)
+float thr = na
+if mode == "Fixed $"
+    thr := fixedUsd
+else if array.size(samples) >= 50
+    thr := array.avg(samples) + sigmaK * array.stdev(samples)
+
+// ---------- shelves storage ----------
+var array<line>  shLines = array.new<line>()
+var array<float> shLvls  = array.new<float>()
+var array<bool>  shBuy   = array.new<bool>()
+
+bubbleSize(float ratio) =>
+    ratio >= 8 ? size.huge : ratio >= 4 ? size.large : ratio >= 2.5 ? size.normal : ratio >= 1.5 ? size.small : size.tiny
+
+fmtUsd(float v) =>
+    v >= 1e9 ? "$" + str.tostring(v / 1e9, "#.##") + "B" : v >= 1e6 ? "$" + str.tostring(v / 1e6, "#.##") + "M" : v >= 1e3 ? "$" + str.tostring(v / 1e3, "#.#") + "K" : "$" + str.tostring(v, "#")
+
+float buyUsd  = 0.0
+float sellUsd = 0.0
+int   buyN    = 0
+int   sellN   = 0
+float maxRatio = 0.0
+bool  maxIsBuy = true
+
+int n = array.size(vA)
+if n > 0
+    for i = 0 to n - 1
+        float v = array.get(vA, i)
+        float o = array.get(oA, i)
+        float c = array.get(cA, i)
+        if na(v) or na(c) or v <= 0
+            continue
+        float usd = v * c * pv
+        if not na(thr) and usd >= thr
+            // direction: sub-bar body, falling back to the previous sub-bar's close
+            bool isBuy = c > o
+            if c == o
+                float prevC = i > 0 ? array.get(cA, i - 1) : close[1]
+                isBuy := na(prevC) ? true : c >= prevC
+            float ratio = usd / thr
+            color col = isBuy ? buyCol : sellCol
+            string tip = (isBuy ? "WHALE BUY " : "WHALE SELL ") + fmtUsd(usd) + "\nPrice " + str.tostring(c, format.mintick) + "\n" + str.tostring(ratio, "#.#") + "× threshold\n" + str.format_time(array.get(tA, i), "yyyy-MM-dd HH:mm", syminfo.timezone)
+            label.new(bar_index, c, "", xloc = xloc.bar_index, yloc = yloc.price, color = color.new(col, 45), style = label.style_circle, size = bubbleSize(ratio), tooltip = tip)
+            if isBuy
+                buyUsd += usd
+                buyN += 1
+            else
+                sellUsd += usd
+                sellN += 1
+            if ratio > maxRatio
+                maxRatio := ratio
+                maxIsBuy := isBuy
+            if showShelf and ratio >= shelfMult
+                line ln = line.new(bar_index, c, bar_index + 1, c, xloc = xloc.bar_index, color = color.new(col, 35), width = 2)
+                array.push(shLines, ln)
+                array.push(shLvls, c)
+                array.push(shBuy, isBuy)
+                if array.size(shLines) > maxShelf
+                    line oldLn = array.shift(shLines)
+                    array.shift(shLvls)
+                    bool oldBuy = array.shift(shBuy)
+                    line.set_color(oldLn, color.new(oldBuy ? buyCol : sellCol, 85))
+        array.push(samples, usd)
+    while array.size(samples) > sampleLen
+        array.shift(samples)
+
+// ---------- extend / break shelves ----------
+int k = array.size(shLines) - 1
+while k >= 0
+    line  ln  = array.get(shLines, k)
+    float lvl = array.get(shLvls, k)
+    bool  b   = array.get(shBuy, k)
+    bool born = line.get_x1(ln) == bar_index
+    float pxDn = breakOn == "Close" ? close : low
+    float pxUp = breakOn == "Close" ? close : high
+    bool broken = not born and (b ? pxDn < lvl : pxUp > lvl)
+    if broken
+        line.set_x2(ln, bar_index)
+        line.set_style(ln, line.style_dotted)
+        line.set_color(ln, color.new(b ? buyCol : sellCol, 80))
+        array.remove(shLines, k)
+        array.remove(shLvls, k)
+        array.remove(shBuy, k)
+    else
+        line.set_x2(ln, bar_index + 1)
+    k -= 1
+
+// ---------- alerts ----------
+bool whaleBuy  = buyN > 0
+bool whaleSell = sellN > 0
+alertcondition(whaleBuy, "Whale buy", "Whale BUY print on {{ticker}} at {{close}}")
+alertcondition(whaleSell, "Whale sell", "Whale SELL print on {{ticker}} at {{close}}")
+if barstate.isconfirmed and maxRatio >= 1
+    alert((maxIsBuy ? "Whale BUY on " : "Whale SELL on ") + syminfo.ticker + " · buys " + fmtUsd(buyUsd) + " / sells " + fmtUsd(sellUsd) + " · biggest " + str.tostring(maxRatio, "#.#") + "× threshold", alert.freq_once_per_bar_close)
+
+// ---------- info panel ----------
+var table tbl = table.new(position.top_right, 2, 3, bgcolor = color.new(#121521, 10), border_width = 0, frame_color = color.new(#222839, 0), frame_width = 1)
+if showTbl and barstate.islast
+    table.cell(tbl, 0, 0, "Whales Map", text_color = color.rgb(34, 211, 238), text_size = size.small)
+    table.cell(tbl, 1, 0, "scan " + effTf + (effTf == timeframe.period ? " ⚠ lower chart TF" : ""), text_color = color.gray, text_size = size.tiny)
+    table.cell(tbl, 0, 1, "Threshold", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 1, na(thr) ? "warming up…" : fmtUsd(thr), text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 2, "Live shelves", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 2, str.tostring(array.size(shLines)), text_color = color.white, text_size = size.small)
